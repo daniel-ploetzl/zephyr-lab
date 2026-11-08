@@ -1,0 +1,13 @@
+#ifndef ZEPHYR_LAB_H
+#define ZEPHYR_LAB_H
+
+#define MAIN_PERIOD_MS		7
+#define REPORT_PERIOD_MS	1000
+
+#define WORKER_STACK_SIZE	1024
+#define WORKER_PRIORITY		11
+#define WORKER_PERIOD_MS	1
+
+#define INCREMENT_DELAY_US	1000
+
+#endif
