@@ -1,13 +1,13 @@
-# zephyr-lab — RTOS fundamentals on Zephyr (Raspberry Pi Pico 2 W)
+# zephyr-lab: RTOS fundamentals on Zephyr (Raspberry Pi Pico 2 W)
 
 ## Overview
 
 A small Zephyr application, built up one idea per step, to learn how an RTOS schedules threads and how threads share data safely. Each step adds a single kernel feature and makes its effect visible on the serial console.
 
-Current state (step 3): two threads of different priority add to one shared counter. A `k_mutex` protects it, and once a second `main` prints whether any update was lost.
+Current state (step 4): two threads of different priority add to one shared counter, which a `k_mutex` protects. A kernel timer wakes `worker` every 2 ms through a semaphore. Once a second `main` prints whether any update was lost and how often the timer fired.
 
 ```text
-main 245 + worker 854 = 1099, shared 1099, lost 0
+main 246 + worker 1002 = 1248, shared 1248, lost 0, timer 1003
 ```
 
 ---
@@ -19,22 +19,23 @@ main 245 + worker 854 = 1099, shared 1099, lost 0
 | 1 | One thread that sleeps without blocking the rest of the system | `k_msleep()`, `k_uptime_get()` |
 | 2 | Two threads, priorities, starvation | `K_THREAD_DEFINE`, `CONFIG_MAIN_THREAD_PRIORITY` |
 | 3 | A shared counter, a race condition and its fix | `K_MUTEX_DEFINE`, `k_mutex_lock()`, `k_mutex_unlock()` |
+| 4 | A timer interrupt that wakes a thread | `K_TIMER_DEFINE`, `K_SEM_DEFINE`, `k_sem_give()`, `k_sem_take()` |
 
 ---
 
 ## Layout
 
 - `src/main.c`
-  The two threads: `main` (priority 10) adds every 7 ms and reports once a second; `worker` (priority 11) adds every 1 ms.
+  The two threads, the timer and the semaphore. `main` (priority 10) adds every 7 ms and reports once a second. The timer's interrupt gives the semaphore every 2 ms and `worker` (priority 11) adds each time it can take it.
 
 - `src/counter.c`, `inc/counter.h`
-  The shared counter. The data and its mutex are `static` in `counter.c`; other files can only use `counter_add()` and `counter_read()`, which both take the lock.
+  The shared counter. The data and its mutex are `static` in `counter.c`. Other files can only use `counter_add()` and `counter_read()`, which both take the lock.
 
 - `inc/zephyr_lab.h`
   Application constants: periods, stack size, worker priority and the artificial delay that makes the race visible.
 
 - `prj.conf`
-  Kconfig settings read by Zephyr itself. Only the main thread's priority, which places `main` below the USB driver's thread (priority 8).
+  Kconfig settings read by Zephyr itself: the main thread's priority, which places `main` below the USB driver's thread (priority 8), and `CONFIG_ASSERT=y`, which keeps `__ASSERT()` checks in the image.
 
 - `CMakeLists.txt`
   Adds the `cdc-acm-console` snippet, so `printk` output goes to a USB serial port.
@@ -43,9 +44,17 @@ main 245 + worker 854 = 1099, shared 1099, lost 0
 
 ## The race, in short
 
-`counter_add()` reads the counter, waits `INCREMENT_DELAY_US` (1 ms), then writes the value plus one. Without the mutex, `main` can preempt `worker` inside that gap and one of the two additions is lost (about 60 per second). With the mutex, `main` waits until `worker` has written and nothing is lost. The delay only widens a gap that exists in every unprotected `count++`.
+`counter_add()` reads the counter, waits `INCREMENT_DELAY_US` (1 ms), then writes the value plus one. Without the mutex, `main` can preempt `worker` inside that gap and one of the two additions is lost. With the mutex, `main` waits until `worker` has written and nothing is lost. The delay only widens a gap that exists in every unprotected `count++`.
 
 To see the race, comment out the `k_mutex_lock()` and `k_mutex_unlock()` lines in `counter_add()`.
+
+---
+
+## Interrupt and thread
+
+The timer's expiry function runs in interrupt context, where nothing may block. It cannot call `counter_add()`, because `k_mutex_lock()` may have to wait. So it only calls `k_sem_give()`, and `worker` does the work after `k_sem_take()`. With `CONFIG_ASSERT=y`, calling `counter_add()` from the interrupt halts the kernel with "mutexes cannot be used inside ISRs".
+
+The semaphore's limit is 1. If `worker` is still busy when the timer fires again, that wake-up is dropped. The report shows it as `timer` greater than `worker` (by more than the one wake-up still in flight).
 
 ---
 
@@ -68,7 +77,7 @@ For another board, use a pristine build: `west build -p -b <board>`.
 
 ### Outputs
 
-`build/zephyr/` holds `zephyr.elf`, `zephyr.bin`, `zephyr.hex` and `zephyr.uf2`. The image uses about 43 KB of flash and 16.6 KB of RAM, most of it for the USB stack.
+`build/zephyr/` holds `zephyr.elf`, `zephyr.bin`, `zephyr.hex` and `zephyr.uf2`. The image uses about 56 KB of flash and 16.7 KB of RAM. Most of it is the USB stack. About 13 KB are the kernel's assert checks.
 
 ---
 
@@ -103,4 +112,4 @@ west build -b native_sim/native/64 -d build-sim .
 | Kind | Where | What |
 |---|---|---|
 | Intended | `inc/zephyr_lab.h` | `INCREMENT_DELAY_US` holds the mutex for 1 ms on every addition, so `main` can wait up to 1 ms. It exists only to make the race visible. |
-| Limit | `src/counter.c` | The counts are 32-bit. At about 550 additions per second, `shared_count` wraps after about 90 days. The `lost` figure stays correct across the wrap, because the subtraction is unsigned. |
+| Limit | `src/counter.c` | The counts are 32-bit. At about 620 additions per second, `shared_count` wraps after about 80 days. The `lost` figure stays correct across the wrap, because the subtraction is unsigned. |
