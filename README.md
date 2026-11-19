@@ -4,10 +4,10 @@
 
 A small Zephyr application, built up one idea per step, to learn how an RTOS schedules threads and how threads share data safely. Each step adds a single kernel feature and makes its effect visible on the serial console.
 
-Current state (step 4): two threads of different priority add to one shared counter, which a `k_mutex` protects. A kernel timer wakes `worker` every 2 ms through a semaphore. Once a second `main` prints whether any update was lost and how often the timer fired.
+Current state (step 5): two threads of different priority add to one shared counter, which a `k_mutex` protects. A kernel timer sends a sequence number and timestamp to `worker` every 2 ms through a message queue. Once a second `main` reports counter correctness, rejected events and delivery delay.
 
 ```text
-main 246 + worker 1002 = 1248, shared 1248, lost 0, timer 1003
+main 246 + worker 1002 = 1248, shared 1248, lost 0, timer 1003, dropped 0, seq 1002, wait 0 ms
 ```
 
 ---
@@ -20,19 +20,20 @@ main 246 + worker 1002 = 1248, shared 1248, lost 0, timer 1003
 | 2 | Two threads, priorities, starvation | `K_THREAD_DEFINE`, `CONFIG_MAIN_THREAD_PRIORITY` |
 | 3 | A shared counter, a race condition and its fix | `K_MUTEX_DEFINE`, `k_mutex_lock()`, `k_mutex_unlock()` |
 | 4 | A timer interrupt that wakes a thread | `K_TIMER_DEFINE`, `K_SEM_DEFINE`, `k_sem_give()`, `k_sem_take()` |
+| 5 | Copy event data from an interrupt to a thread through a bounded queue | `K_MSGQ_DEFINE_STATIC`, `k_msgq_put()`, `k_msgq_get()` |
 
 ---
 
 ## Layout
 
 - `src/main.c`
-  The two threads, the timer and the semaphore. `main` (priority 10) adds every 7 ms and reports once a second. The timer's interrupt gives the semaphore every 2 ms and `worker` (priority 11) adds each time it can take it.
+  The two threads, the timer and the message queue. `main` (priority 10) adds every 7 ms and reports once a second. The timer's interrupt sends an event every 2 ms and `worker` (priority 11) adds once for each event it receives.
 
 - `src/counter.c`, `inc/counter.h`
   The shared counter. The data and its mutex are `static` in `counter.c`. Other files can only use `counter_add()` and `counter_read()`, which both take the lock.
 
 - `inc/zephyr_lab.h`
-  Application constants: periods, stack size, worker priority and the artificial delay that makes the race visible.
+  Application constants: periods, stack size, worker priority, queue capacity and the artificial delay that makes the race visible.
 
 - `prj.conf`
   Kconfig settings read by Zephyr itself: the main thread's priority, which places `main` below the USB driver's thread (priority 8), and `CONFIG_ASSERT=y`, which keeps `__ASSERT()` checks in the image.
@@ -52,9 +53,21 @@ To see the race, comment out the `k_mutex_lock()` and `k_mutex_unlock()` lines i
 
 ## Interrupt and thread
 
-The timer's expiry function runs in interrupt context, where nothing may block. It cannot call `counter_add()`, because `k_mutex_lock()` may have to wait. So it only calls `k_sem_give()`, and `worker` does the work after `k_sem_take()`. With `CONFIG_ASSERT=y`, calling `counter_add()` from the interrupt halts the kernel with "mutexes cannot be used inside ISRs".
+The timer's expiry function runs in interrupt context, where nothing may block. It cannot call `counter_add()`, because `k_mutex_lock()` may have to wait. Instead it calls `k_msgq_put()` with `K_NO_WAIT`. `worker` waits in `k_msgq_get()` with `K_FOREVER` and does the work in thread context. The queue replaces step 4's semaphore because receiving a message already wakes the worker.
 
-The semaphore's limit is 1. If `worker` is still busy when the timer fires again, that wake-up is dropped. The report shows it as `timer` greater than `worker` (by more than the one wake-up still in flight).
+The queue copies each event's sequence number and creation time. Four events fit in its fixed buffer, using 32 bytes plus the queue object. If it fills, the interrupt drops the newest event and increments `dropped`. There is no allocation or retry loop.
+
+### Reading the report
+
+`lost` checks the shared counter. `dropped` counts rejected events. These measure different things: the counter can stay correct while events are rejected. `seq` is the sequence number most recently published by the worker after completing an addition. `wait` is that worker diagnostic's delivery delay, measured when receiving the event before waiting for the counter mutex.
+
+The diagnostics are individual atomic readings, sampled separately from the counter snapshot and timer status. An event may also be buffered or being processed, so the figures do not form one exact accounting equation. `wait 0 ms` means less than one millisecond on this clock, rather than no delay at all.
+
+### Try overload
+
+1. Set `WORKER_PERIOD_MS` to `1` in `inc/zephyr_lab.h`. Build and run. The CPU cannot handle every event, so `dropped` grows while `lost` stays at 0.
+2. Keep that period and change `EVENT_QUEUE_CAPACITY` from `4` to `16`. Compare `wait`: more buffering allows events to become older, without making the worker faster.
+3. Restore the defaults before continuing. The annotated mirror's `EXPLAINED.md` has measured results and further exercises.
 
 ---
 
@@ -77,7 +90,7 @@ For another board, use a pristine build: `west build -p -b <board>`.
 
 ### Outputs
 
-`build/zephyr/` holds `zephyr.elf`, `zephyr.bin`, `zephyr.hex` and `zephyr.uf2`. The image uses about 56 KB of flash and 16.7 KB of RAM. Most of it is the USB stack. About 13 KB are the kernel's assert checks.
+`build/zephyr/` holds `zephyr.elf`, `zephyr.bin`, `zephyr.hex` and `zephyr.uf2`. The step 5 build uses 56,252 bytes of flash and 16,752 bytes of RAM. Most of it is the USB stack. About 13 KB are the kernel's assert checks.
 
 ---
 
@@ -113,3 +126,4 @@ west build -b native_sim/native/64 -d build-sim .
 |---|---|---|
 | Intended | `inc/zephyr_lab.h` | `INCREMENT_DELAY_US` holds the mutex for 1 ms on every addition, so `main` can wait up to 1 ms. It exists only to make the race visible. |
 | Limit | `src/counter.c` | The counts are 32-bit. At about 620 additions per second, `shared_count` wraps after about 80 days. The `lost` figure stays correct across the wrap, because the subtraction is unsigned. |
+| Limit | `src/main.c` | Event timestamps wrap after about 49.7 days. Unsigned delay subtraction works across a wrap if delivery takes less than one full wrap. Sequence numbers also wrap and are diagnostics rather than permanent event identifiers. |
